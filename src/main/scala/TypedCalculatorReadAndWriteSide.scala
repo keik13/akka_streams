@@ -5,12 +5,17 @@ import akka.persistence.cassandra.query.scaladsl.CassandraReadJournal
 import akka.persistence.query.{EventEnvelope, PersistenceQuery}
 import akka.persistence.typed.PersistenceId
 import akka.persistence.typed.scaladsl.{Effect, EventSourcedBehavior}
+import akka.stream.{ClosedShape, FlowShape, SinkShape, SourceShape}
 import akka.stream.alpakka.slick.scaladsl.{Slick, SlickSession}
-import akka.stream.scaladsl.{Flow, GraphDSL, Sink, Source}
+import akka.stream.scaladsl.GraphDSL.Implicits.{SourceShapeArrow, port2flow}
+import akka.stream.scaladsl.{Broadcast, Flow, GraphDSL, Sink, Source}
 import akka_typed.TypedCalculatorWriteSide.{Add, Added, Command, Divide, Divided, Multiplied, Multiply}
-import scalikejdbc.DB.using
 import scalikejdbc.{ConnectionPool, ConnectionPoolSettings, DB}
-import akka_typed.CalculatorRepository.{getLatestsOffsetAndResult, initDatabase, updatedResultAndOffset}
+import akka_typed.CalculatorRepository.{Result, createSession, getLatestsOffsetAndResult, initDatabase, updatedResultAndOffset}
+import slick.jdbc.GetResult
+
+import scala.concurrent.Await
+import scala.concurrent.duration.DurationInt
 
 object  akka_typed{
 
@@ -103,11 +108,12 @@ object  akka_typed{
   case class TypedCalculatorReadSide(system: ActorSystem[NotUsed]){
     initDatabase
 
+    implicit val session = createSession()
     implicit val materializer = system.classicSystem
-    var (offset, latestCalculatedResult) = getLatestsOffsetAndResult
-    val startOffset: Int = if (offset == 1) 1 else offset + 1
+    val result: Result = getLatestsOffsetAndResult
+    val startOffset = if (result.offset == 1) 1 else result.offset + 1
 
-    val readJournal = PersistenceQuery(system).readJournalFor[CassandraReadJournal](CassandraReadJournal.Identifier)
+    val readJournal: CassandraReadJournal = PersistenceQuery(system).readJournalFor[CassandraReadJournal](CassandraReadJournal.Identifier)
 
     /*
     /**
@@ -129,16 +135,16 @@ object  akka_typed{
 
 
     val source: Source[EventEnvelope, NotUsed] = readJournal.eventsByPersistenceId("001", startOffset, Long.MaxValue)
-    /*
+
       // homework, spoiler
         def updateState(event: Any, seqNum: Long): Result ={
-          val newStste = event match {
-            case Added(_amount)=>
-              ???
-            case Multiplied(_,amount)=>
-              ???
-            case Divided(_amount)=>
-              ???
+          val newState = event match {
+            case Added(_, amount)=>
+              result.state + amount
+            case Multiplied(_, amount)=>
+              result.state * amount
+            case Divided(_, amount)=>
+              result.state / amount
           }
           Result(newState, seqNum)
         }
@@ -146,60 +152,44 @@ object  akka_typed{
         val graph = GraphDSL.create(){
           implicit builder: GraphDSL.Builder[NotUsed] =>
             //1.
-            val input = builder.add(source)
-            val stateUpdater = builder.add(Flow[EventEnvelope].map(e=> updateState(e.event, e.sequenceNr)))
-            val localSaveOutput = builder.add(Sink.foreach[Result]{
+            val input: SourceShape[EventEnvelope] = builder.add(source)
+            val stateUpdater: FlowShape[EventEnvelope, Result] = builder.add(Flow[EventEnvelope].map(e=> updateState(e.event, e.sequenceNr)))
+            val localSaveOutput: SinkShape[Result] = builder.add(Sink.foreach[Result]{
               r=>
-                latestCalculatedResult = r.state
+                result.copy(state = r.state)
                 println("something to print")
             })
-
-            val dbSaveOutput = builder.add(
-              Slick.sink[Result](r=> updatedResultAndOffset(r))
+            val dbSaveOutput: SinkShape[Result] = builder.add(
+              Slick.sink[Result](r => updatedResultAndOffset(r))
             )
 
             // надо разделить builder на 2  c помощью Broadcats
             //см https://blog.rockthejvm.com/akka-streams-graphs/
+            val broadcats = builder.add(Broadcast[Result](2))
 
             //надо будет сохранить flow(разделенный на 2) в localSaveOutput и dbSaveOutput
             //в конце закрыть граф и запустить его RunnableGraph.fromGraph(graph).run()
 
+            input ~> stateUpdater
+            stateUpdater.out ~> broadcats
+            broadcats.out(0) ~> dbSaveOutput
+            broadcats.out(1) ~> localSaveOutput
 
 
-
-        }*/
-
-    source
-      .map{x =>
-        println(x.toString())
-        x
-      }
-      .runForeach{
-        event =>
-          event.event match {
-            case Added(_, amount) =>
-              latestCalculatedResult += amount
-              updatedResultAndOffset(latestCalculatedResult, event.sequenceNr)
-              println(s"Log from Added: $latestCalculatedResult")
-            case Multiplied(_, amount) =>
-              latestCalculatedResult *= amount
-              updatedResultAndOffset(latestCalculatedResult, event.sequenceNr)
-              println(s"Log from Multiplied: $latestCalculatedResult")
-            case Divided(_, amount) =>
-              latestCalculatedResult /= amount
-              updatedResultAndOffset(latestCalculatedResult, event.sequenceNr)
-              println(s"Log from Divided: $latestCalculatedResult")
-          }
-      }
+            //4
+            ClosedShape
+        }
   }
 
   object CalculatorRepository{
 
     //homework how to do
     //1.
-    /*    def createSession(): SlickSession ={
+       def createSession(): SlickSession ={
           //создайте сессию согласно документации
-        }*/
+          val session: SlickSession = SlickSession.forConfig("slick-postgres")
+          session
+        }
 
 
 
@@ -209,42 +199,23 @@ object  akka_typed{
       val poolSettings = ConnectionPoolSettings(initialSize = 10, maxSize = 100)
       ConnectionPool.singleton("jdbc:postgresql://localhost:5432/demo", "docker", "docker", poolSettings)
     }
-
+    import slick.jdbc.PostgresProfile.api._
     // homework
-    // case class Result(state: Double, offset:Long)
-    /*    def getLatestsOffsetAndResult: Result ={
+     case class Result(state: Double, offset:Long)
+        def getLatestsOffsetAndResult(implicit session: SlickSession): Result ={
+          implicit val getCoffeeResult: GetResult[Result] = GetResult(r => Result(r.<<, r.<<))
           val query = sql"select * from public.result where id = 1;"
-            .as[Double]
+            .as[Result]
             .headOption
           //надо создать future для db.run
           //с помошью await получите результат или прокиньте ошибку если результат нет
-
-        }*/
-
-
-    def getLatestsOffsetAndResult: (Int, Double) ={
-      val entities =
-        DB readOnly { session=>
-          session.list("select * from public.result where id = 1;") {
-            row => (
-              row.int("write_side_offset"),
-              row.double("calculated_value"))
-          }
+          Await.result(session.db.run(query), 3.second).getOrElse(throw new RuntimeException())
         }
-      entities.head
-    }
 
 
     //homework how to do
-    def updatedResultAndOffset(calculated: Double, offset: Long): Unit ={
-      using(DB(ConnectionPool.borrow())) {
-        db =>
-          db.autoClose(true)
-          db.localTx {
-            _.update("update public.result set calculated_value = ?, write_side_offset = ? where id = 1"
-              , calculated, offset)
-          }
-      }
+    def updatedResultAndOffset(newState: Result): DBIO[Int] ={
+      sqlu"update public.result set calculated_value = ${newState.state}, write_side_offset = ${newState.offset} where id = 1"
     }
   }
 
