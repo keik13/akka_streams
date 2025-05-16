@@ -8,7 +8,7 @@ import akka.persistence.typed.scaladsl.{Effect, EventSourcedBehavior}
 import akka.stream.{ClosedShape, FlowShape, SinkShape, SourceShape}
 import akka.stream.alpakka.slick.scaladsl.{Slick, SlickSession}
 import akka.stream.scaladsl.GraphDSL.Implicits.{SourceShapeArrow, port2flow}
-import akka.stream.scaladsl.{Broadcast, Flow, GraphDSL, Sink, Source}
+import akka.stream.scaladsl.{Broadcast, Flow, GraphDSL, RunnableGraph, Sink, Source}
 import akka_typed.TypedCalculatorWriteSide.{Add, Added, Command, Divide, Divided, Multiplied, Multiply}
 import scalikejdbc.{ConnectionPool, ConnectionPoolSettings, DB}
 import akka_typed.CalculatorRepository.{Result, createSession, getLatestsOffsetAndResult, initDatabase, updatedResultAndOffset}
@@ -179,6 +179,7 @@ object  akka_typed{
             //4
             ClosedShape
         }
+    RunnableGraph.fromGraph(graph).run()
   }
 
   object CalculatorRepository{
